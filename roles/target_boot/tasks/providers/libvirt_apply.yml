@@ -1,0 +1,226 @@
+---
+- name: Determine whether the requested ISO is already attached
+  ansible.builtin.set_fact:
+    libvirt_discovery_iso_attached: >-
+      {{
+        libvirt_boot_iso_path
+        in libvirt_vm_block_devices.stdout
+      }}
+
+- name: Refuse to change a running VM without the requested ISO
+  ansible.builtin.assert:
+    that:
+      - >-
+        target_libvirt_vm_state != 'running'
+        or libvirt_discovery_iso_attached | bool
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} is already running without the requested
+      discovery ISO. The automation will not stop or modify a running VM.
+    quiet: true
+
+- name: Stage the discovery ISO for QEMU
+  ansible.builtin.copy:
+    src: "{{ discovery_iso_path }}"
+    dest: "{{ libvirt_boot_iso_path }}"
+    remote_src: true
+    owner: qemu
+    group: qemu
+    mode: "0640"
+    setype: virt_content_t
+  become: true
+  when:
+    - target_libvirt_vm_state == 'shut off'
+    - not (libvirt_discovery_iso_attached | bool)
+
+- name: Attach the discovery ISO as a persistent SATA CD-ROM
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - attach-disk
+      - "{{ libvirt_vm_name }}"
+      - "{{ libvirt_boot_iso_path }}"
+      - "{{ libvirt_iso_target }}"
+      - --type
+      - cdrom
+      - --mode
+      - readonly
+      - --targetbus
+      - sata
+      - --config
+  environment:
+    LC_ALL: C
+  when:
+    - target_libvirt_vm_state == 'shut off'
+    - not (libvirt_discovery_iso_attached | bool)
+
+- name: Read the persistent VM XML before changing boot order
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - dumpxml
+      - "{{ libvirt_vm_name }}"
+      - --inactive
+  environment:
+    LC_ALL: C
+  register: libvirt_domain_xml_before_boot
+  changed_when: false
+
+- name: Configure temporary CD-ROM-first boot order
+  ansible.builtin.command:
+    argv:
+      - virt-xml
+      - --connect
+      - "{{ libvirt_uri }}"
+      - "{{ libvirt_vm_name }}"
+      - --edit
+      - --boot
+      - cdrom,hd
+  environment:
+    LC_ALL: C
+  when:
+    - target_libvirt_vm_state == 'shut off'
+    - >-
+      libvirt_domain_xml_before_boot.stdout
+      is not search("boot dev='cdrom'")
+
+- name: Read the persistent VM configuration after ISO attachment
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - dumpxml
+      - "{{ libvirt_vm_name }}"
+      - --inactive
+  environment:
+    LC_ALL: C
+  register: libvirt_domain_xml_after_boot
+  changed_when: false
+
+- name: Require the ISO and temporary boot order
+  ansible.builtin.assert:
+    that:
+      - libvirt_boot_iso_path in libvirt_domain_xml_after_boot.stdout
+      - >-
+        libvirt_domain_xml_after_boot.stdout
+        is search("boot dev='cdrom'")
+      - >-
+        libvirt_domain_xml_after_boot.stdout
+        is search("boot dev='hd'")
+    fail_msg: >-
+      The discovery ISO or CD-ROM-first boot order was not applied
+      to VM {{ libvirt_vm_name }}.
+    quiet: true
+  when: target_libvirt_vm_state == 'shut off'
+- name: Start the VM from the discovery ISO
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - start
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  when: target_libvirt_vm_state == 'shut off'
+
+- name: Restore installed-disk boot for the next restart
+  ansible.builtin.command:
+    argv:
+      - virt-xml
+      - --connect
+      - "{{ libvirt_uri }}"
+      - "{{ libvirt_vm_name }}"
+      - --edit
+      - --boot
+      - hd
+  environment:
+    LC_ALL: C
+  when: target_libvirt_vm_state == 'shut off'
+
+- name: Remove the discovery CD-ROM from the next boot configuration
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - detach-disk
+      - "{{ libvirt_vm_name }}"
+      - "{{ libvirt_iso_target }}"
+      - --config
+  environment:
+    LC_ALL: C
+  when: target_libvirt_vm_state == 'shut off'
+
+- name: Read the next-boot libvirt configuration
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - dumpxml
+      - "{{ libvirt_vm_name }}"
+      - --inactive
+  environment:
+    LC_ALL: C
+  register: libvirt_next_boot_xml
+  changed_when: false
+
+- name: Require the next boot to use only the installed disk
+  ansible.builtin.assert:
+    that:
+      - >-
+        libvirt_next_boot_xml.stdout
+        is search("boot dev='hd'")
+      - >-
+        libvirt_next_boot_xml.stdout
+        is not search("boot dev='cdrom'")
+      - libvirt_boot_iso_path not in libvirt_next_boot_xml.stdout
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} is running, but its next boot was not
+      safely restored to the installed disk.
+    quiet: true
+
+- name: Read the VM state after the boot operation
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domstate
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: libvirt_vm_state_after_boot
+  changed_when: false
+
+- name: Require a running discovery VM
+  ansible.builtin.assert:
+    that:
+      - libvirt_vm_state_after_boot.stdout | trim == 'running'
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} did not reach the running state.
+    quiet: true
+
+- name: Store the successful libvirt boot state
+  ansible.builtin.set_fact:
+    target_boot_performed: >-
+      {{ target_libvirt_vm_state == 'shut off' }}
+    target_libvirt_vm_state: running
+    sno_manual_action_required: false
+
+- name: Report the completed libvirt boot operation
+  ansible.builtin.debug:
+    msg:
+      - "VM: {{ libvirt_vm_name }}"
+      - "Discovery ISO: {{ libvirt_boot_iso_path }}"
+      - "Boot order: CD-ROM, then virtual disk"
+      - "VM state: running"
+      - >-
+        VM newly started:
+        {{ target_boot_performed }}
+      - The installation disk has not yet been selected or erased.

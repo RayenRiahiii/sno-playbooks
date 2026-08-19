@@ -1,0 +1,221 @@
+---
+- name: Boot the SNO VM and wait for Assisted Installer discovery
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read the Red Hat offline token from the environment
+      ansible.builtin.set_fact:
+        redhat_offline_token: "{{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}"
+      no_log: true
+
+    - name: Require the Red Hat offline token
+      ansible.builtin.assert:
+        that:
+          - redhat_offline_token | length > 0
+        fail_msg: Set REDHAT_OFFLINE_TOKEN in WSL before running this playbook.
+
+    - name: Check the discovery ISO
+      ansible.builtin.stat:
+        path: "{{ discovery_iso_path }}"
+      register: discovery_iso
+
+    - name: Require a non-empty discovery ISO
+      ansible.builtin.assert:
+        that:
+          - discovery_iso.stat.exists
+          - discovery_iso.stat.isreg
+          - discovery_iso.stat.size > 1000000000
+        fail_msg: Run playbooks/01_prepare_assisted.yml before booting the VM.
+
+    - name: Read the VirtualBox VM state
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - showvminfo
+          - "{{ virtualbox_vm_name }}"
+          - --machinereadable
+      register: virtualbox_vm_info
+      changed_when: false
+
+    - name: Refuse an unsafe VirtualBox state
+      ansible.builtin.assert:
+        that:
+          - >-
+            'VMState="poweroff"' in virtualbox_vm_info.stdout or
+            'VMState="running"' in virtualbox_vm_info.stdout or
+            'VMState="saved"' in virtualbox_vm_info.stdout
+        fail_msg: >-
+          The VM must be powered off, saved, or already running. Unsafe states
+          are never discarded automatically.
+
+    - name: Prefer the installed disk on future reboots
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - modifyvm
+          - "{{ virtualbox_vm_name }}"
+          - --boot1
+          - disk
+          - --boot2
+          - dvd
+          - --boot3
+          - none
+          - --boot4
+          - none
+      when: "'VMState=\"poweroff\"' in virtualbox_vm_info.stdout"
+
+    - name: Attach the discovery ISO
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - storageattach
+          - "{{ virtualbox_vm_name }}"
+          - --storagectl
+          - SATA Controller
+          - --port
+          - '1'
+          - --device
+          - '0'
+          - --type
+          - dvddrive
+          - --medium
+          - "{{ virtualbox_iso_path_windows }}"
+      when: "'VMState=\"poweroff\"' in virtualbox_vm_info.stdout"
+
+    - name: Start or resume the SNO VM
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - startvm
+          - "{{ virtualbox_vm_name }}"
+          - --type
+          - headless
+      when: >-
+        'VMState="poweroff"' in virtualbox_vm_info.stdout or
+        'VMState="saved"' in virtualbox_vm_info.stdout
+
+    - name: Exchange the offline token for an API token
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: redhat_auth
+      no_log: true
+
+    - name: Save the short-lived API token
+      ansible.builtin.set_fact:
+        assisted_api_token: "{{ redhat_auth.json.access_token }}"
+      no_log: true
+
+    - name: Find the SNO cluster
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_clusters
+
+    - name: Select the SNO cluster
+      ansible.builtin.set_fact:
+        matching_clusters: >-
+          {{ assisted_clusters.json
+             | selectattr('name', 'equalto', cluster_name)
+             | list }}
+
+    - name: Require exactly one SNO cluster
+      ansible.builtin.assert:
+        that:
+          - matching_clusters | length == 1
+        fail_msg: Expected exactly one Assisted Installer cluster named {{ cluster_name }}.
+
+    - name: Store the cluster identifier
+      ansible.builtin.set_fact:
+        cluster_id: "{{ matching_clusters[0].id }}"
+
+    - name: Find the cluster infrastructure environment
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/infra-envs?cluster_id={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_infra_envs
+
+    - name: Select the cluster infrastructure environment
+      ansible.builtin.set_fact:
+        matching_infra_envs: >-
+          {{ assisted_infra_envs.json
+             | selectattr('name', 'equalto', infra_env_name)
+             | list }}
+
+    - name: Require exactly one infrastructure environment
+      ansible.builtin.assert:
+        that:
+          - matching_infra_envs | length == 1
+        fail_msg: Expected exactly one InfraEnv named {{ infra_env_name }}.
+
+    - name: Store the infrastructure environment identifier
+      ansible.builtin.set_fact:
+        infra_env_id: "{{ matching_infra_envs[0].id }}"
+
+    - name: Wait for the VM to register with Assisted Installer
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/infra-envs/{{ infra_env_id }}/hosts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: discovered_hosts
+      until:
+        - discovered_hosts.json | length == 1
+        - discovered_hosts.json[0].status != 'disconnected'
+      retries: 36
+      delay: 20
+
+    - name: Store the discovered host
+      ansible.builtin.set_fact:
+        discovered_host: "{{ discovered_hosts.json[0] }}"
+
+    - name: Assign the control-plane role to the SNO host
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/infra-envs/{{ infra_env_id }}/hosts/{{ discovered_host.id }}
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        body_format: json
+        body:
+          host_role: master
+        status_code:
+          - 200
+          - 201
+        return_content: true
+      register: configured_host
+
+    - name: Parse the discovered hardware inventory
+      ansible.builtin.set_fact:
+        host_inventory: "{{ discovered_host.inventory | from_json }}"
+      when:
+        - discovered_host.inventory is defined
+        - discovered_host.inventory | length > 0
+
+    - name: Report discovered host details
+      ansible.builtin.debug:
+        msg:
+          - "Cluster ID: {{ cluster_id }}"
+          - "InfraEnv ID: {{ infra_env_id }}"
+          - "Host ID: {{ discovered_host.id }}"
+          - "Host status: {{ configured_host.json.status | default(discovered_host.status) }}"
+          - "Detected disks: {{ host_inventory.disks | default([]) | length }}"
+          - The host has been discovered, but disk installation has not been started.

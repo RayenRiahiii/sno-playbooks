@@ -1,0 +1,11 @@
+---
+all:
+  hosts:
+    localhost:
+      ansible_connection: local
+
+    dns_server:
+      ansible_host: 192.168.200.2
+      ansible_user: user
+      ansible_ssh_private_key_file: >-
+        {{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/sno_lab_ed25519

@@ -1,0 +1,230 @@
+---
+- name: Plan a safe, resumable SNO installation on VirtualBox
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    preinstallation_statuses:
+      - pending-for-input
+      - insufficient
+      - ready
+    active_installation_statuses:
+      - preparing-for-installation
+      - installing
+      - installing-pending-user-action
+      - finalizing
+    failed_installation_statuses:
+      - error
+      - cancelled
+
+  tasks:
+    - name: Read the Red Hat offline token from the environment
+      ansible.builtin.set_fact:
+        redhat_offline_token: "{{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}"
+      no_log: true
+
+    - name: Require the Red Hat offline token
+      ansible.builtin.assert:
+        that:
+          - redhat_offline_token | length > 0
+        fail_msg: Set REDHAT_OFFLINE_TOKEN in WSL before running this playbook.
+
+    - name: Read the DNS VM state
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - showvminfo
+          - "{{ virtualbox_dns_vm_name }}"
+          - --machinereadable
+      register: dns_vm_info
+      changed_when: false
+
+    - name: Require a safe DNS VM state
+      ansible.builtin.assert:
+        that:
+          - >-
+            'VMState="poweroff"' in dns_vm_info.stdout or
+            'VMState="saved"' in dns_vm_info.stdout or
+            'VMState="running"' in dns_vm_info.stdout
+        fail_msg: The DNS VM is in an unsafe VirtualBox state and was not modified.
+
+    - name: Start or resume the DNS VM
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - startvm
+          - "{{ virtualbox_dns_vm_name }}"
+          - --type
+          - headless
+      when: >-
+        'VMState="poweroff"' in dns_vm_info.stdout or
+        'VMState="saved"' in dns_vm_info.stdout
+
+    - name: Wait for the lab DNS service
+      ansible.builtin.wait_for:
+        host: "{{ sno_dns_servers[0] }}"
+        port: 53
+        state: started
+        timeout: 180
+
+    - name: Exchange the offline token for an API token
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: workflow_redhat_auth
+      no_log: true
+
+    - name: Find existing clusters
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ workflow_redhat_auth.json.access_token }}"
+        status_code: 200
+        return_content: true
+      register: workflow_clusters
+
+    - name: Select clusters with the requested name
+      ansible.builtin.set_fact:
+        workflow_matching_clusters: >-
+          {{ workflow_clusters.json
+             | selectattr('name', 'equalto', cluster_name)
+             | list }}
+
+    - name: Refuse ambiguous cluster reuse
+      ansible.builtin.assert:
+        that:
+          - workflow_matching_clusters | length <= 1
+        fail_msg: More than one Assisted Installer cluster is named {{ cluster_name }}.
+
+    - name: Store the initial workflow state
+      ansible.builtin.set_fact:
+        sno_workflow_initial_status: >-
+          {{ (workflow_matching_clusters[0].status
+              if workflow_matching_clusters | length == 1
+              else 'not-created') }}
+
+    - name: Refuse failed or unknown installation states
+      ansible.builtin.assert:
+        that:
+          - sno_workflow_initial_status not in failed_installation_statuses
+          - >-
+            sno_workflow_initial_status == 'not-created' or
+            sno_workflow_initial_status == 'installed' or
+            sno_workflow_initial_status in preinstallation_statuses or
+            sno_workflow_initial_status in active_installation_statuses
+        fail_msg: >-
+          Cluster {{ cluster_name }} is in unsupported state
+          {{ sno_workflow_initial_status }}. No disk or VM was modified.
+
+    - name: Choose only the required workflow stages
+      ansible.builtin.set_fact:
+        sno_workflow_prepare_required: "{{ sno_workflow_initial_status == 'not-created' }}"
+        sno_workflow_discovery_required: >-
+          {{ sno_workflow_initial_status == 'not-created' or
+             sno_workflow_initial_status in preinstallation_statuses }}
+        sno_workflow_install_required: >-
+          {{ sno_workflow_initial_status == 'not-created' or
+             sno_workflow_initial_status in preinstallation_statuses }}
+        sno_workflow_resume_vm_required: >-
+          {{ sno_workflow_initial_status == 'installed' or
+             sno_workflow_initial_status in active_installation_statuses }}
+
+    - name: Report the selected workflow
+      ansible.builtin.debug:
+        msg:
+          - "Initial cluster state: {{ sno_workflow_initial_status }}"
+          - "Prepare ISO: {{ sno_workflow_prepare_required }}"
+          - "Boot and discover: {{ sno_workflow_discovery_required }}"
+          - "Start installation: {{ sno_workflow_install_required }}"
+          - "Resume installed/installation VM: {{ sno_workflow_resume_vm_required }}"
+
+    - name: Read the SNO VM state for an installation resume
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - showvminfo
+          - "{{ virtualbox_vm_name }}"
+          - --machinereadable
+      register: resume_sno_vm_info
+      changed_when: false
+      when: sno_workflow_resume_vm_required | bool
+
+    - name: Require a safe SNO VM resume state
+      ansible.builtin.assert:
+        that:
+          - >-
+            'VMState="poweroff"' in resume_sno_vm_info.stdout or
+            'VMState="saved"' in resume_sno_vm_info.stdout or
+            'VMState="running"' in resume_sno_vm_info.stdout
+        fail_msg: The SNO VM is in an unsafe state and was not modified.
+      when: sno_workflow_resume_vm_required | bool
+
+    - name: Start or resume an existing SNO installation
+      ansible.builtin.command:
+        argv:
+          - "{{ virtualbox_manage_path }}"
+          - startvm
+          - "{{ virtualbox_vm_name }}"
+          - --type
+          - headless
+      when:
+        - sno_workflow_resume_vm_required | bool
+        - >-
+          'VMState="poweroff"' in resume_sno_vm_info.stdout or
+          'VMState="saved"' in resume_sno_vm_info.stdout
+
+    - name: Wait for SSH after restoring a saved SNO state
+      ansible.builtin.wait_for:
+        host: "{{ sno_ip_address }}"
+        port: 22
+        state: started
+        timeout: 300
+      when:
+        - sno_workflow_resume_vm_required | bool
+        - "'VMState=\"saved\"' in resume_sno_vm_info.stdout"
+
+    - name: Correct the SNO clock after restoring a saved state
+      ansible.builtin.command:
+        argv:
+          - /usr/bin/timeout
+          - '120'
+          - ssh
+          - -o
+          - BatchMode=yes
+          - -o
+          - ConnectTimeout=10
+          - -o
+          - StrictHostKeyChecking=no
+          - -o
+          - UserKnownHostsFile=/dev/null
+          - -i
+          - "{{ ssh_private_key_path }}"
+          - "core@{{ sno_ip_address }}"
+          - sudo chronyc makestep
+      register: restored_clock_step
+      changed_when: "'200 OK' in restored_clock_step.stdout"
+      retries: 3
+      delay: 10
+      until: restored_clock_step.rc == 0
+      when:
+        - sno_workflow_resume_vm_required | bool
+        - "'VMState=\"saved\"' in resume_sno_vm_info.stdout"
+
+- import_playbook: 01_prepare_assisted.yml
+  when: hostvars['localhost'].sno_workflow_prepare_required | bool
+
+- import_playbook: 02_boot_and_discover.yml
+  when: hostvars['localhost'].sno_workflow_discovery_required | bool
+
+- import_playbook: 04_start_install.yml
+  when: hostvars['localhost'].sno_workflow_install_required | bool
+
+- import_playbook: 06_wait_and_finalize.yml

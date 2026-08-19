@@ -1,0 +1,72 @@
+---
+
+target_schema_version: 1
+target_id: vbox-sno-lab
+cpu_architecture: x86_64
+
+# How Ansible can boot this target
+automation_mode: plan
+target_provider: virtualbox
+
+# OpenShift configuration
+cluster_name: sno
+base_dns_domain: lab.test
+openshift_version: "4.20"
+
+# Target network configuration
+sno_mac_address: "08:00:27:EF:16:40"
+sno_ip_address: 192.168.200.50
+sno_prefix_length: 24
+sno_gateway: 192.168.200.1
+sno_dns_servers:
+  - 192.168.200.2
+
+# Disk that OpenShift will eventually erase
+installation_disk_path: /dev/sda
+
+# VirtualBox-specific information
+virtualbox_vm_name: sno-lab
+virtualbox_dns_vm_name: Ansible Controller
+
+infra_env_name: "{{ cluster_name }}-infra-env"
+discovery_image_type: full-iso
+discovery_iso_path: "/mnt/c/Users/ASUS/Desktop/OC sno/artifacts/{{ cluster_name }}-discovery.iso"
+
+sno_static_network_enabled: true
+sno_interface_name: eth0
+
+virtualbox_iso_path_windows: 'C:\Users\ASUS\Desktop\OC sno\artifacts\{{ cluster_name }}-discovery.iso'
+virtualbox_storage_controller: SATA Controller
+virtualbox_iso_port: 1
+virtualbox_iso_device: 0
+
+# Maximum host-registration wait: 120 × 15 seconds = 30 minutes
+host_registration_retries: 120
+host_registration_delay: 15
+
+# OpenShift SNO requires an adequately sized installation disk
+minimum_installation_disk_bytes: 100000000000
+
+credentials_directory: "/mnt/c/Users/ASUS/Desktop/OC sno/artifacts/{{ cluster_name }}/credentials"
+kubeconfig_path: "{{ credentials_directory }}/kubeconfig"
+kubeadmin_password_path: "{{ credentials_directory }}/kubeadmin-password"
+
+# Wait up to 30 minutes for the Kubernetes API
+api_access_retries: 120
+api_access_delay: 15
+
+# For this limited lab, report convergence without waiting for every operator
+wait_for_cluster_convergence: false
+require_cluster_convergence: false
+
+# DNS can later use existing, dnsmasq, or manual
+dns_provider: dnsmasq
+dnsmasq_inventory_host: dns_server
+dnsmasq_config_path: "/etc/dnsmasq.d/openshift-{{ target_id }}.conf"
+dnsmasq_systemd_dropin_directory: /etc/systemd/system/dnsmasq.service.d
+dnsmasq_systemd_dropin_path: /etc/systemd/system/dnsmasq.service.d/network-online.conf
+dns_validation_server: 192.168.200.2
+dns_enforce_before_boot: true
+
+# Must be explicitly true before the main playbook can modify this target
+target_modification_approved: false

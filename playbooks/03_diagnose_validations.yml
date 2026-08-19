@@ -1,0 +1,169 @@
+---
+- name: Diagnose SNO Assisted Installer validations
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read the Red Hat offline token from the environment
+      ansible.builtin.set_fact:
+        redhat_offline_token: "{{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}"
+      no_log: true
+
+    - name: Require the Red Hat offline token
+      ansible.builtin.assert:
+        that:
+          - redhat_offline_token | length > 0
+        fail_msg: Set REDHAT_OFFLINE_TOKEN in WSL before running this playbook.
+
+    - name: Exchange the offline token for an API token
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: redhat_auth
+      no_log: true
+
+    - name: Save the short-lived API token
+      ansible.builtin.set_fact:
+        assisted_api_token: "{{ redhat_auth.json.access_token }}"
+      no_log: true
+
+    - name: Find the SNO cluster
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_clusters
+
+    - name: Select the SNO cluster
+      ansible.builtin.set_fact:
+        matching_clusters: >-
+          {{ assisted_clusters.json
+             | selectattr('name', 'equalto', cluster_name)
+             | list }}
+
+    - name: Require exactly one SNO cluster
+      ansible.builtin.assert:
+        that:
+          - matching_clusters | length == 1
+        fail_msg: Expected exactly one Assisted Installer cluster named {{ cluster_name }}.
+
+    - name: Read the current cluster details
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters/{{ matching_clusters[0].id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: current_cluster
+
+    - name: Find the cluster infrastructure environment
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/infra-envs?cluster_id={{ matching_clusters[0].id }}
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_infra_envs
+
+    - name: Select the cluster infrastructure environment
+      ansible.builtin.set_fact:
+        matching_infra_envs: >-
+          {{ assisted_infra_envs.json
+             | selectattr('name', 'equalto', infra_env_name)
+             | list }}
+
+    - name: Require exactly one infrastructure environment
+      ansible.builtin.assert:
+        that:
+          - matching_infra_envs | length == 1
+        fail_msg: Expected exactly one InfraEnv named {{ infra_env_name }}.
+
+    - name: Read discovered hosts
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/infra-envs/{{ matching_infra_envs[0].id }}/hosts
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: discovered_hosts
+
+    - name: Require exactly one discovered host
+      ansible.builtin.assert:
+        that:
+          - discovered_hosts.json | length == 1
+        fail_msg: Expected exactly one discovered SNO host.
+
+    - name: Parse validation and inventory data
+      ansible.builtin.set_fact:
+        discovered_host: "{{ discovered_hosts.json[0] }}"
+        host_validations: >-
+          {{ discovered_hosts.json[0].validations_info | default('{}') | from_json }}
+        cluster_validations: >-
+          {{ current_cluster.json.validations_info | default('{}') | from_json }}
+        host_inventory: >-
+          {{ discovered_hosts.json[0].inventory | default('{}') | from_json }}
+
+    - name: Report current status
+      ansible.builtin.debug:
+        msg:
+          - "Cluster status: {{ current_cluster.json.status }}"
+          - "Cluster status info: {{ current_cluster.json.status_info | default('none') }}"
+          - "Host status: {{ discovered_host.status }}"
+          - "Host status info: {{ discovered_host.status_info | default('none') }}"
+          - "Detected CPU threads: {{ host_inventory.cpu.count | default('unknown') }}"
+          - >-
+            Detected RAM GiB: {{
+              ((host_inventory.memory.physical_bytes | default(0) | float)
+              / 1073741824) | round(2)
+            }}
+          - "Detected disk count: {{ host_inventory.disks | default([]) | length }}"
+
+    - name: Report discovered disks
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.path | default(item.name | default('unknown')) }}:
+          {{ ((item.size_bytes | default(0) | float) / 1073741824) | round(2) }} GiB,
+          bootable={{ item.bootable | default('unknown') }}
+      loop: "{{ host_inventory.disks | default([]) }}"
+      loop_control:
+        label: "{{ item.path | default(item.name | default('disk')) }}"
+
+    - name: Report incomplete host validations
+      ansible.builtin.debug:
+        msg: >-
+          HOST [{{ item.0.key }}] {{ item.1.id }}:
+          status={{ item.1.status }}; {{ item.1.message }}
+      loop: "{{ host_validations | dict2items | subelements('value') }}"
+      loop_control:
+        label: "{{ item.1.id }}"
+      when: item.1.status != 'success'
+
+    - name: Report incomplete cluster validations
+      ansible.builtin.debug:
+        msg: >-
+          CLUSTER [{{ item.0.key }}] {{ item.1.id }}:
+          status={{ item.1.status }}; {{ item.1.message }}
+      loop: "{{ cluster_validations | dict2items | subelements('value') }}"
+      loop_control:
+        label: "{{ item.1.id }}"
+      when: item.1.status != 'success'
+
+    - name: Confirm diagnostic safety
+      ansible.builtin.debug:
+        msg: No installation or disk modification was performed.
+

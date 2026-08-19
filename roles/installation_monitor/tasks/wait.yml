@@ -1,0 +1,71 @@
+---
+- name: Wait for Assisted Installer completion
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ assisted_wait_script_path }}"
+      - --api-url
+      - "{{ assisted_api_url }}"
+      - --sso-token-url
+      - "{{ redhat_sso_token_url }}"
+      - --cluster-id
+      - "{{ sno_cluster_id }}"
+      - --expected
+      - installed
+      - --failure
+      - error
+      - --failure
+      - cancelled
+      - --timeout-seconds
+      - >-
+        {{
+          installation_wait_retries | int
+          * installation_wait_delay | int
+        }}
+      - --poll-seconds
+      - "{{ installation_wait_delay }}"
+  environment:
+    REDHAT_OFFLINE_TOKEN: "{{ redhat_offline_token }}"
+  register: installation_completion_wait
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- name: Require successful monitoring completion
+  ansible.builtin.assert:
+    that:
+      - installation_completion_wait.rc == 0
+    fail_msg: >-
+      Installation monitoring did not complete successfully:
+      {{
+        installation_completion_wait.stderr
+        | default('no details reported')
+      }}
+    quiet: true
+
+- name: Store the completed cluster
+  ansible.builtin.set_fact:
+    completed_sno_cluster: >-
+      {{ installation_completion_wait.stdout | from_json }}
+    sno_installation_completed: true
+
+- name: Require an installed cluster
+  ansible.builtin.assert:
+    that:
+      - completed_sno_cluster.status == 'installed'
+    fail_msg: >-
+      Assisted Installer returned status
+      {{ completed_sno_cluster.status }}:
+      {{
+        completed_sno_cluster.status_info
+        | default('no details reported')
+      }}
+    quiet: true
+
+- name: Report Assisted Installer completion
+  ansible.builtin.debug:
+    msg:
+      - "Cluster: {{ completed_sno_cluster.name }}"
+      - "Status: {{ completed_sno_cluster.status }}"
+      - Assisted Installer has completed the disk installation.
+      - OpenShift credentials can now be downloaded.

@@ -1,0 +1,277 @@
+---
+- name: Refuse an unexpected persistent CD-ROM
+  ansible.builtin.assert:
+    that:
+      - >-
+        (
+          post_install_libvirt_inactive_xml.stdout
+          is not search("device='cdrom'")
+        )
+        or
+        (
+          libvirt_boot_iso_path
+          in post_install_libvirt_inactive_xml.stdout
+        )
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} contains an unexpected persistent
+      CD-ROM. It will not be detached automatically.
+    quiet: true
+
+- name: Restore installed-disk boot order when required
+  ansible.builtin.command:
+    argv:
+      - virt-xml
+      - --connect
+      - "{{ libvirt_uri }}"
+      - "{{ libvirt_vm_name }}"
+      - --edit
+      - --boot
+      - hd
+  environment:
+    LC_ALL: C
+  when: not (libvirt_next_boot_is_disk | bool)
+
+- name: Detach the persistent discovery ISO when required
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - detach-disk
+      - "{{ libvirt_vm_name }}"
+      - "{{ libvirt_iso_target }}"
+      - --config
+  environment:
+    LC_ALL: C
+  when: libvirt_persistent_iso_attached | bool
+
+- name: Read the repaired next-boot configuration
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - dumpxml
+      - "{{ libvirt_vm_name }}"
+      - --inactive
+  environment:
+    LC_ALL: C
+  register: post_install_repaired_xml
+  changed_when: false
+
+- name: Require disk-only next boot
+  ansible.builtin.assert:
+    that:
+      - >-
+        post_install_repaired_xml.stdout
+        is search("boot dev='hd'")
+      - >-
+        post_install_repaired_xml.stdout
+        is not search("boot dev='cdrom'")
+      - libvirt_boot_iso_path not in post_install_repaired_xml.stdout
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} was not safely configured to boot
+      from its installed disk.
+    quiet: true
+
+- name: Start a stopped VM from the installed disk
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - start
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  when: sno_post_install_vm_state == 'shut off'
+
+- name: Wait for SSH on the current operating system
+  ansible.builtin.wait_for:
+    host: "{{ sno_ip_address }}"
+    port: 22
+    state: started
+    connect_timeout: "{{ post_install_ssh_connect_timeout }}"
+    timeout: "{{ post_install_ssh_timeout }}"
+    sleep: 10
+
+- name: Read the current kernel command line
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - "30"
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=10
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - UserKnownHostsFile=/dev/null
+      - -i
+      - "{{ ssh_private_key_path }}"
+      - "core@{{ sno_ip_address }}"
+      - cat
+      - /proc/cmdline
+  register: post_install_current_cmdline
+  changed_when: false
+  failed_when: false
+  until: post_install_current_cmdline.rc == 0
+  retries: 30
+  delay: 10
+
+- name: Determine whether the live discovery environment is running
+  ansible.builtin.set_fact:
+    post_install_live_environment_running: >-
+      {{
+        'coreos.liveiso='
+        in post_install_current_cmdline.stdout
+      }}
+
+- name: Request a clean shutdown of the live discovery environment
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - "45"
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=10
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - UserKnownHostsFile=/dev/null
+      - -i
+      - "{{ ssh_private_key_path }}"
+      - "core@{{ sno_ip_address }}"
+      - sudo
+      - systemctl
+      - poweroff
+  register: post_install_shutdown_request
+  changed_when: true
+  failed_when: false
+  when: post_install_live_environment_running | bool
+
+- name: Wait for the live environment to power off
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domstate
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: post_install_libvirt_poweroff
+  changed_when: false
+  until:
+    - post_install_libvirt_poweroff.stdout | trim == 'shut off'
+  retries: "{{ post_install_poweroff_retries }}"
+  delay: "{{ post_install_poweroff_delay }}"
+  when: post_install_live_environment_running | bool
+
+- name: Start the VM from the installed disk after shutdown
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - start
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  when: post_install_live_environment_running | bool
+
+- name: Wait for SSH after installed-disk restart
+  ansible.builtin.wait_for:
+    host: "{{ sno_ip_address }}"
+    port: 22
+    state: started
+    connect_timeout: "{{ post_install_ssh_connect_timeout }}"
+    timeout: "{{ post_install_ssh_timeout }}"
+    delay: 10
+    sleep: 10
+  when: post_install_live_environment_running | bool
+
+- name: Verify the final installed-disk kernel command line
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - "30"
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=10
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - UserKnownHostsFile=/dev/null
+      - -i
+      - "{{ ssh_private_key_path }}"
+      - "core@{{ sno_ip_address }}"
+      - cat
+      - /proc/cmdline
+  register: post_install_final_cmdline
+  changed_when: false
+  failed_when: false
+  until:
+    - post_install_final_cmdline.rc == 0
+    - "'coreos.liveiso=' not in post_install_final_cmdline.stdout"
+  retries: 30
+  delay: 10
+
+- name: Enable VM autostart
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - autostart
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  changed_when: false
+
+- name: Read the final libvirt VM state
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domstate
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: post_install_final_libvirt_state
+  changed_when: false
+
+- name: Require a running installed system
+  ansible.builtin.assert:
+    that:
+      - post_install_final_libvirt_state.stdout | trim == 'running'
+      - post_install_final_cmdline.rc == 0
+      - "'coreos.liveiso=' not in post_install_final_cmdline.stdout"
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} is not confirmed to be running
+      from the installed RHCOS disk.
+    quiet: true
+
+- name: Store the completed libvirt post-install state
+  ansible.builtin.set_fact:
+    sno_post_install_boot_ready: true
+    sno_post_install_action_performed: >-
+      {{
+        (sno_post_install_action | trim) != 'none'
+      }}
+
+- name: Report successful libvirt post-install handling
+  ansible.builtin.debug:
+    msg:
+      - "VM: {{ libvirt_vm_name }}"
+      - Installed RHCOS disk boot confirmed.
+      - Persistent discovery ISO detached.
+      - Next boot source is the virtual disk.
+      - VM autostart is enabled.

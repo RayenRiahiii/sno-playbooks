@@ -1,0 +1,17 @@
+---
+target_provider: virtualbox
+
+cluster_name: sno
+base_dns_domain: lab.test
+openshift_version: '4.20'
+
+sno_mac_address: '08:00:27:EF:16:40'
+sno_ip_address: 192.168.200.50
+sno_prefix_length: 24
+sno_gateway: 192.168.200.1
+sno_dns_servers:
+  - 192.168.200.2
+installation_disk_path: /dev/sda
+
+virtualbox_vm_name: sno-lab
+virtualbox_dns_vm_name: Ansible Controller

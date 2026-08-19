@@ -1,0 +1,8 @@
+---
+- name: Create SNO resources and download the discovery ISO
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - assisted_installer
+

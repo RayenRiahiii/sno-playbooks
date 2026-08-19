@@ -1,0 +1,70 @@
+---
+# Target contract
+target_schema_version: 1
+target_id: physical-sno-01
+automation_mode: plan
+target_modification_approved: false
+
+# Boot provider
+target_provider: redfish
+
+# OpenShift cluster
+cluster_name: edge-sno-01
+base_dns_domain: example.com
+openshift_version: "4.20"
+cpu_architecture: x86_64
+
+# Target network
+sno_static_network_enabled: true
+sno_interface_name: eno1
+sno_mac_address: "AA:BB:CC:DD:EE:FF"
+sno_ip_address: 192.0.2.50
+sno_prefix_length: 24
+sno_gateway: 192.0.2.1
+sno_dns_servers:
+  - 192.0.2.53
+
+# Installation disk
+installation_disk_path: /dev/sda
+minimum_installation_disk_bytes: 100000000000
+
+# Assisted Installer resources
+infra_env_name: "{{ cluster_name }}-infra-env"
+discovery_image_type: full-iso
+
+# Local files on the Ansible controller
+discovery_iso_path: >-
+  /mnt/c/openshift-sno/artifacts/{{ target_id }}/discovery.iso
+
+credentials_directory: >-
+  /mnt/c/openshift-sno/artifacts/{{ target_id }}/credentials
+
+kubeconfig_path: "{{ credentials_directory }}/kubeconfig"
+kubeadmin_password_path: >-
+  {{ credentials_directory }}/kubeadmin-password
+
+# Waiting behavior
+host_registration_retries: 120
+host_registration_delay: 15
+api_access_retries: 120
+api_access_delay: 15
+wait_for_cluster_convergence: true
+require_cluster_convergence: true
+
+# DNS
+# Use an existing organization DNS server for this example.
+dns_provider: existing
+dns_validation_server: 192.0.2.53
+dns_enforce_before_boot: true
+
+# Redfish BMC
+redfish_base_url: https://192.0.2.20
+redfish_system_id: System.Embedded.1
+redfish_manager_id: iDRAC.Embedded.1
+redfish_virtual_media_id: CD
+redfish_validate_certs: false
+
+# The BMC must be able to download this URL.
+# A local WSL filesystem path will not work here.
+redfish_iso_url: >-
+  https://automation.example.com/openshift/{{ target_id }}/discovery.iso

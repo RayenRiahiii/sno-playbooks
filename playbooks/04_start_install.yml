@@ -1,0 +1,239 @@
+---
+- name: Select the SNO disk and explicitly start installation
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    install_confirmation: ''
+
+  tasks:
+    - name: Read the Red Hat offline token from the environment
+      ansible.builtin.set_fact:
+        redhat_offline_token: "{{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}"
+      no_log: true
+
+    - name: Require the Red Hat offline token
+      ansible.builtin.assert:
+        that:
+          - redhat_offline_token | length > 0
+        fail_msg: Set REDHAT_OFFLINE_TOKEN in WSL before running this playbook.
+
+    - name: Exchange the offline token for an API token
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: redhat_auth
+      no_log: true
+
+    - name: Save the short-lived API token
+      ansible.builtin.set_fact:
+        assisted_api_token: "{{ redhat_auth.json.access_token }}"
+      no_log: true
+
+    - name: Find the SNO cluster
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_clusters
+
+    - name: Select the SNO cluster
+      ansible.builtin.set_fact:
+        matching_clusters: >-
+          {{ assisted_clusters.json
+             | selectattr('name', 'equalto', cluster_name)
+             | list }}
+
+    - name: Require exactly one SNO cluster
+      ansible.builtin.assert:
+        that:
+          - matching_clusters | length == 1
+        fail_msg: Expected exactly one Assisted Installer cluster named {{ cluster_name }}.
+
+    - name: Wait for the SNO cluster to become ready
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ assisted_wait_script_path }}"
+          - --api-url
+          - "{{ assisted_api_url }}"
+          - --sso-token-url
+          - "{{ redhat_sso_token_url }}"
+          - --cluster-id
+          - "{{ matching_clusters[0].id }}"
+          - --expected
+          - ready
+          - --failure
+          - error
+          - --failure
+          - cancelled
+          - --timeout-seconds
+          - "{{ cluster_ready_retries | int * cluster_ready_delay | int }}"
+          - --poll-seconds
+          - "{{ cluster_ready_delay }}"
+      environment:
+        REDHAT_OFFLINE_TOKEN: "{{ redhat_offline_token }}"
+      register: install_ready_wait
+      changed_when: false
+      no_log: true
+
+    - name: Store the ready SNO cluster
+      ansible.builtin.set_fact:
+        install_ready_cluster: "{{ install_ready_wait.stdout | from_json }}"
+      no_log: true
+
+    - name: Require a ready SNO cluster
+      ansible.builtin.assert:
+        that:
+          - install_ready_cluster.status == 'ready'
+        fail_msg: >-
+          Cluster status is {{ install_ready_cluster.status }}:
+          {{ install_ready_cluster.status_info | default('no details reported') }}.
+          Run playbooks/03_diagnose_validations.yml for validation details.
+
+    - name: Store the cluster identifier
+      ansible.builtin.set_fact:
+        cluster_id: "{{ matching_clusters[0].id }}"
+
+    - name: Find the cluster infrastructure environment
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/infra-envs?cluster_id={{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: assisted_infra_envs
+
+    - name: Select the cluster infrastructure environment
+      ansible.builtin.set_fact:
+        matching_infra_envs: >-
+          {{ assisted_infra_envs.json
+             | selectattr('name', 'equalto', infra_env_name)
+             | list }}
+
+    - name: Require exactly one infrastructure environment
+      ansible.builtin.assert:
+        that:
+          - matching_infra_envs | length == 1
+        fail_msg: Expected exactly one InfraEnv named {{ infra_env_name }}.
+
+    - name: Store the infrastructure environment identifier
+      ansible.builtin.set_fact:
+        infra_env_id: "{{ matching_infra_envs[0].id }}"
+
+    - name: Read the discovered host
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/infra-envs/{{ infra_env_id }}/hosts"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: discovered_hosts
+
+    - name: Require exactly one ready host
+      ansible.builtin.assert:
+        that:
+          - discovered_hosts.json | length == 1
+          - discovered_hosts.json[0].status == 'known'
+        fail_msg: The SNO host must be connected and ready before installation.
+
+    - name: Parse the host disk inventory
+      ansible.builtin.set_fact:
+        discovered_host: "{{ discovered_hosts.json[0] }}"
+        host_inventory: "{{ discovered_hosts.json[0].inventory | from_json }}"
+
+    - name: Select the requested installation disk
+      ansible.builtin.set_fact:
+        matching_install_disks: >-
+          {{ host_inventory.disks
+             | selectattr('path', 'equalto', installation_disk_path)
+             | list }}
+
+    - name: Require one eligible 100 GB installation disk
+      ansible.builtin.assert:
+        that:
+          - matching_install_disks | length == 1
+          - matching_install_disks[0].size_bytes | int >= 100000000000
+          - matching_install_disks[0].installation_eligibility.eligible | bool
+        fail_msg: >-
+          {{ installation_disk_path }} is missing, too small, or not eligible for installation.
+
+    - name: Report the destructive installation target
+      ansible.builtin.debug:
+        msg:
+          - "Cluster: {{ cluster_name }} ({{ cluster_id }})"
+          - "Host: {{ discovered_host.id }}"
+          - >-
+            Disk: {{ matching_install_disks[0].path }}
+            ({{ (matching_install_disks[0].size_bytes | int / 1073741824) | round(1) }} GiB)
+          - All existing data on this virtual disk will be permanently erased.
+
+    - name: Require the exact disk-erasure confirmation
+      ansible.builtin.assert:
+        that:
+          - install_confirmation == ('ERASE ' ~ installation_disk_path)
+        fail_msg: >-
+          Installation was not started. Pass the exact confirmation only after reviewing
+          the target: -e '{"install_confirmation":"ERASE {{ installation_disk_path }}"}'
+
+    - name: Assign the explicit installation disk
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/infra-envs/{{ infra_env_id }}/hosts/{{ discovered_host.id }}
+        method: PATCH
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        body_format: json
+        body:
+          disks_selected_config:
+            - id: "{{ matching_install_disks[0].id }}"
+              role: install
+        status_code:
+          - 200
+          - 201
+        return_content: true
+
+    - name: Wait for validations after disk selection
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters/{{ cluster_id }}"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code: 200
+        return_content: true
+      register: ready_cluster
+      until: ready_cluster.json.status == 'ready'
+      retries: 30
+      delay: 10
+
+    - name: Start the cluster installation
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters/{{ cluster_id }}/actions/install"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ assisted_api_token }}"
+        status_code:
+          - 200
+          - 201
+          - 202
+        return_content: true
+      register: started_install
+
+    - name: Report the installation request
+      ansible.builtin.debug:
+        msg:
+          - "Installation started for cluster {{ cluster_name }}."
+          - "Status: {{ started_install.json.status | default('installation requested') }}"
+          - Keep the DNS VM and the Windows host running throughout installation.

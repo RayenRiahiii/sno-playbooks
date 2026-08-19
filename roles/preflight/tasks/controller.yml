@@ -1,0 +1,93 @@
+---
+- name: Read the Red Hat offline token
+  ansible.builtin.set_fact:
+    redhat_offline_token: >-
+      {{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}
+  no_log: true
+
+- name: Require the Red Hat offline token
+  ansible.builtin.assert:
+    that:
+      - redhat_offline_token | length > 0
+    fail_msg: Export REDHAT_OFFLINE_TOKEN before running the playbook.
+    quiet: true
+  no_log: true
+
+- name: Require credential path variables
+  ansible.builtin.assert:
+    that:
+      - pull_secret_path is defined
+      - ssh_public_key_path is defined
+      - oc_binary_path is defined
+    fail_msg: Credential or oc binary path variables are missing.
+    quiet: true
+
+- name: Check the pull secret file
+  ansible.builtin.stat:
+    path: "{{ pull_secret_path }}"
+  register: pull_secret_file
+
+- name: Check the SSH public key
+  ansible.builtin.stat:
+    path: "{{ ssh_public_key_path }}"
+  register: ssh_public_key_file
+
+- name: Check the oc executable
+  ansible.builtin.stat:
+    path: "{{ oc_binary_path }}"
+  register: oc_binary_file
+
+- name: Require the local files
+  ansible.builtin.assert:
+    that:
+      - pull_secret_file.stat.exists
+      - pull_secret_file.stat.isreg
+      - pull_secret_file.stat.size > 0
+      - ssh_public_key_file.stat.exists
+      - ssh_public_key_file.stat.isreg
+      - ssh_public_key_file.stat.size > 0
+      - oc_binary_file.stat.exists
+      - oc_binary_file.stat.isreg
+      - oc_binary_file.stat.executable
+    fail_msg: Check the pull secret, SSH public key, and oc binary paths.
+    quiet: true
+
+- name: Verify that the pull secret contains valid JSON
+  ansible.builtin.set_fact:
+    validated_pull_secret: >-
+      {{ lookup('ansible.builtin.file', pull_secret_path) | from_json }}
+  no_log: true
+
+- name: Read the SSH public key
+  ansible.builtin.set_fact:
+    validated_ssh_public_key: >-
+      {{ lookup('ansible.builtin.file', ssh_public_key_path) | trim }}
+
+- name: Validate the SSH public key format
+  ansible.builtin.assert:
+    that:
+      - validated_ssh_public_key is match('^ssh-(rsa|ed25519|ecdsa)')
+    fail_msg: The SSH public key format is not recognized.
+    quiet: true
+
+- name: Check VBoxManage
+  ansible.builtin.command:
+    argv:
+      - "{{ virtualbox_manage_path }}"
+      - --version
+  register: virtualbox_version
+  changed_when: false
+  when: target_provider == 'virtualbox'
+
+- name: Report controller readiness
+  ansible.builtin.debug:
+    msg:
+      - Pull secret JSON is valid.
+      - SSH public key is valid.
+      - "oc executable: {{ oc_binary_path }}"
+      - >-
+        VirtualBox version:
+        {{ virtualbox_version.stdout
+           if target_provider == 'virtualbox'
+           else 'not required' }}
+      - No external API or target was modified.

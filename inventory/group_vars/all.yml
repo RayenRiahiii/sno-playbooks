@@ -1,0 +1,48 @@
+---
+# Red Hat services
+assisted_api_url: https://api.openshift.com/api/assisted-install
+redhat_sso_token_url: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+
+# Default OpenShift internal networks
+network_type: OVNKubernetes
+cluster_network_cidr: 10.128.0.0/14
+cluster_network_host_prefix: 23
+service_network_cidr: 172.30.0.0/16
+
+# Files and tools located on the Ansible controller
+pull_secret_path: /mnt/c/Users/ASUS/Downloads/pull-secret.txt
+ssh_public_key_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/sno_lab_ed25519.pub"
+ssh_private_key_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.ssh/sno_lab_ed25519"
+oc_binary_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.local/bin/oc"
+assisted_wait_script_path: "{{ playbook_dir }}/../scripts/assisted_wait.py"
+
+# Assisted Installer defaults derived from the target profile
+infra_env_name: "{{ cluster_name }}-infra-env"
+discovery_image_type: full-iso
+
+# Credential filenames are derived from credentials_directory,
+# which must be supplied by the target profile.
+kubeconfig_path: "{{ credentials_directory }}/kubeconfig"
+kubeadmin_password_path: "{{ credentials_directory }}/kubeadmin-password"
+
+# VirtualBox executable on the Ansible controller.
+# VirtualBox target details must be supplied by the target profile.
+virtualbox_manage_path: /mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe
+
+# Bounded waiting periods
+cluster_ready_retries: 90
+cluster_ready_delay: 20
+
+installation_wait_retries: 720
+installation_wait_delay: 30
+
+cluster_convergence_retries: 720
+cluster_convergence_delay: 30
+
+# Redfish provider defaults.
+# The target profile must provide redfish_base_url.
+# Credentials must remain in REDFISH_USERNAME and REDFISH_PASSWORD.
+redfish_system_id: System.Embedded.1
+redfish_manager_id: iDRAC.Embedded.1
+redfish_virtual_media_id: CD
+redfish_validate_certs: false

@@ -1,0 +1,7 @@
+---
+- name: Configure and validate OpenShift DNS
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - role: dns_preflight

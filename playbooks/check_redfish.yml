@@ -1,0 +1,77 @@
+---
+- name: Check Redfish BMC connectivity
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Require Redfish target variables
+      ansible.builtin.assert:
+        that:
+          - target_provider == 'redfish'
+          - redfish_base_url is defined
+          - redfish_base_url is match('^https?://[^/]+/?$')
+          - redfish_system_id is defined
+          - redfish_manager_id is defined
+        fail_msg: Use a valid Redfish target profile.
+        quiet: true
+
+    - name: Read Redfish credentials
+      ansible.builtin.set_fact:
+        redfish_username_runtime: >-
+          {{ lookup('ansible.builtin.env', 'REDFISH_USERNAME') }}
+        redfish_password_runtime: >-
+          {{ lookup('ansible.builtin.env', 'REDFISH_PASSWORD') }}
+      no_log: true
+
+    - name: Require Redfish credentials
+      ansible.builtin.assert:
+        that:
+          - redfish_username_runtime | length > 0
+          - redfish_password_runtime | length > 0
+        fail_msg: >-
+          Export the real REDFISH_USERNAME and REDFISH_PASSWORD
+          before running this connectivity test.
+        quiet: true
+
+    - name: Query the Redfish service root
+      ansible.builtin.uri:
+        url: >-
+          {{ redfish_base_url | regex_replace('/+$', '') }}/redfish/v1/
+        method: GET
+        url_username: "{{ redfish_username_runtime }}"
+        url_password: "{{ redfish_password_runtime }}"
+        force_basic_auth: true
+        validate_certs: "{{ redfish_validate_certs | bool }}"
+        return_content: true
+        status_code: 200
+        timeout: 30
+      register: redfish_service_root
+      changed_when: false
+      failed_when: false
+      no_log: true
+
+    - name: Require a successful Redfish response
+      ansible.builtin.assert:
+        that:
+          - redfish_service_root.status | default(0) | int == 200
+          - redfish_service_root.json is defined
+        fail_msg: >-
+          The Redfish service could not be reached or authentication
+          failed. Verify the BMC address, network, credentials, and
+          certificate setting.
+        quiet: true
+
+    - name: Report Redfish connectivity
+      ansible.builtin.debug:
+        msg:
+          - "BMC: {{ redfish_base_url }}"
+          - >-
+            Redfish version:
+            {{ redfish_service_root.json.RedfishVersion
+               | default('not reported') }}
+          - >-
+            Service name:
+            {{ redfish_service_root.json.Name
+               | default('Redfish Service') }}
+          - Connection and authentication succeeded.
+          - This check did not modify or restart the physical server.

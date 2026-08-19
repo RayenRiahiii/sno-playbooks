@@ -1,0 +1,114 @@
+---
+- name: Require the libvirt boot settings
+  ansible.builtin.assert:
+    that:
+      - libvirt_uri is defined
+      - libvirt_vm_name is defined
+      - libvirt_network_name is defined
+      - libvirt_disk_target is defined
+      - libvirt_disk_path is defined
+      - libvirt_iso_target is defined
+    fail_msg: The libvirt boot settings are incomplete.
+    quiet: true
+
+- name: Read the libvirt VM state
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domstate
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: libvirt_vm_state_command
+  changed_when: false
+  failed_when: false
+
+- name: Store the libvirt VM state
+  ansible.builtin.set_fact:
+    target_libvirt_vm_state: >-
+      {{ libvirt_vm_state_command.stdout | trim }}
+
+- name: Require an existing safely managed VM
+  ansible.builtin.assert:
+    that:
+      - libvirt_vm_state_command.rc == 0
+      - target_libvirt_vm_state in ['shut off', 'running']
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} does not exist or is in an unsupported
+      state: {{ target_libvirt_vm_state | default('unknown') }}.
+    quiet: true
+
+- name: Read the libvirt VM block devices
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domblklist
+      - "{{ libvirt_vm_name }}"
+      - --details
+  environment:
+    LC_ALL: C
+  register: libvirt_vm_block_devices
+  changed_when: false
+
+- name: Read the libvirt VM interfaces
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domiflist
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: libvirt_vm_interfaces
+  changed_when: false
+
+- name: Require the expected virtual disk
+  ansible.builtin.assert:
+    that:
+      - libvirt_disk_path in libvirt_vm_block_devices.stdout
+      - libvirt_disk_target in libvirt_vm_block_devices.stdout
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} does not contain the expected disk
+      {{ libvirt_disk_path }} as {{ libvirt_disk_target }}.
+    quiet: true
+
+- name: Require the expected virtual network
+  ansible.builtin.assert:
+    that:
+      - libvirt_network_name in libvirt_vm_interfaces.stdout
+      - >-
+        (sno_mac_address | lower)
+        in (libvirt_vm_interfaces.stdout | lower)
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} is not connected to the expected
+      network or does not have the expected MAC address.
+    quiet: true
+
+- name: Store the libvirt boot plan state
+  ansible.builtin.set_fact:
+    sno_manual_action_required: false
+    target_boot_performed: false
+
+- name: Report the libvirt boot plan
+  ansible.builtin.debug:
+    msg:
+      - "Provider: libvirt"
+      - "URI: {{ libvirt_uri }}"
+      - "VM: {{ libvirt_vm_name }}"
+      - "VM state: {{ target_libvirt_vm_state }}"
+      - "Network: {{ libvirt_network_name }}"
+      - "MAC address: {{ sno_mac_address }}"
+      - "Installation disk: {{ libvirt_disk_path }}"
+      - "Discovery ISO: {{ discovery_iso_path }}"
+      - "Automation mode: {{ automation_mode }}"
+      - The VM was inspected but not started or modified.
+
+- name: Apply the libvirt boot operation
+  ansible.builtin.include_tasks:
+    file: providers/libvirt_apply.yml
+  when: automation_mode == 'apply'

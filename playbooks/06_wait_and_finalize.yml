@@ -1,0 +1,200 @@
+---
+- name: Wait for installation, download credentials, and verify SNO
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Read the Red Hat offline token from the environment
+      ansible.builtin.set_fact:
+        redhat_offline_token: "{{ lookup('ansible.builtin.env', 'REDHAT_OFFLINE_TOKEN') }}"
+      no_log: true
+
+    - name: Require the Red Hat offline token
+      ansible.builtin.assert:
+        that:
+          - redhat_offline_token | length > 0
+        fail_msg: Set REDHAT_OFFLINE_TOKEN in WSL before running this playbook.
+
+    - name: Exchange the offline token for a fresh API token
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: final_redhat_auth
+      no_log: true
+
+    - name: Find the SNO cluster
+      ansible.builtin.uri:
+        url: "{{ assisted_api_url }}/v2/clusters"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ final_redhat_auth.json.access_token }}"
+        status_code: 200
+        return_content: true
+      register: final_clusters
+
+    - name: Select the SNO cluster
+      ansible.builtin.set_fact:
+        final_matching_clusters: >-
+          {{ final_clusters.json
+             | selectattr('name', 'equalto', cluster_name)
+             | list }}
+
+    - name: Require exactly one SNO cluster
+      ansible.builtin.assert:
+        that:
+          - final_matching_clusters | length == 1
+        fail_msg: Expected exactly one Assisted Installer cluster named {{ cluster_name }}.
+
+    - name: Wait for Assisted Installer completion
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ assisted_wait_script_path }}"
+          - --api-url
+          - "{{ assisted_api_url }}"
+          - --sso-token-url
+          - "{{ redhat_sso_token_url }}"
+          - --cluster-id
+          - "{{ final_matching_clusters[0].id }}"
+          - --expected
+          - installed
+          - --failure
+          - error
+          - --failure
+          - cancelled
+          - --timeout-seconds
+          - "{{ installation_wait_retries | int * installation_wait_delay | int }}"
+          - --poll-seconds
+          - "{{ installation_wait_delay }}"
+      environment:
+        REDHAT_OFFLINE_TOKEN: "{{ redhat_offline_token }}"
+      register: completed_cluster_wait
+      changed_when: false
+      no_log: true
+
+    - name: Store the completed cluster
+      ansible.builtin.set_fact:
+        completed_cluster: "{{ completed_cluster_wait.stdout | from_json }}"
+      no_log: true
+
+    - name: Require successful Assisted Installer completion
+      ansible.builtin.assert:
+        that:
+          - completed_cluster.status == 'installed'
+        fail_msg: >-
+          Installation ended with {{ completed_cluster.status }}:
+          {{ completed_cluster.status_info | default('no details reported') }}.
+
+    - name: Refresh the API token for credential downloads
+      ansible.builtin.uri:
+        url: "{{ redhat_sso_token_url }}"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          grant_type: refresh_token
+          client_id: cloud-services
+          refresh_token: "{{ redhat_offline_token }}"
+        return_content: true
+        status_code: 200
+      register: credential_redhat_auth
+      no_log: true
+
+    - name: Create the private credentials directory
+      ansible.builtin.file:
+        path: "{{ credentials_directory }}"
+        state: directory
+        mode: '0700'
+
+    - name: Download the administrator kubeconfig
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/clusters/{{ completed_cluster.id
+          }}/downloads/credentials?file_name=kubeconfig
+        method: GET
+        headers:
+          Authorization: "Bearer {{ credential_redhat_auth.json.access_token }}"
+        status_code: 200
+        dest: "{{ kubeconfig_path }}"
+      no_log: true
+
+    - name: Download the kubeadmin password
+      ansible.builtin.uri:
+        url: >-
+          {{ assisted_api_url }}/v2/clusters/{{ completed_cluster.id
+          }}/downloads/credentials?file_name=kubeadmin-password
+        method: GET
+        headers:
+          Authorization: "Bearer {{ credential_redhat_auth.json.access_token }}"
+        status_code: 200
+        dest: "{{ kubeadmin_password_path }}"
+      no_log: true
+
+    - name: Protect the downloaded credentials
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: file
+        mode: '0600'
+      loop:
+        - "{{ kubeconfig_path }}"
+        - "{{ kubeadmin_password_path }}"
+      no_log: true
+
+    - name: Wait for the OpenShift cluster version to converge
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary_path }}"
+          - --kubeconfig
+          - "{{ kubeconfig_path }}"
+          - get
+          - clusterversion
+          - version
+          - -o
+          - >-
+            jsonpath={.status.conditions[?(@.type=="Available")].status}
+            {.status.conditions[?(@.type=="Progressing")].status}
+      register: converged_cluster_version
+      changed_when: false
+      failed_when: false
+      until:
+        - converged_cluster_version.rc == 0
+        - converged_cluster_version.stdout | trim == 'True False'
+      retries: "{{ cluster_convergence_retries }}"
+      delay: "{{ cluster_convergence_delay }}"
+
+    - name: Require a converged OpenShift cluster version
+      ansible.builtin.assert:
+        that:
+          - converged_cluster_version.rc == 0
+          - converged_cluster_version.stdout | trim == 'True False'
+        fail_msg: >-
+          The Assisted Installer finished, but OpenShift did not converge within
+          the configured wait period. Run oc get clusterversion and oc get
+          clusteroperators before taking recovery action.
+
+    - name: Read the installed SNO node
+      ansible.builtin.command:
+        argv:
+          - "{{ oc_binary_path }}"
+          - --kubeconfig
+          - "{{ kubeconfig_path }}"
+          - get
+          - nodes
+          - -o
+          - wide
+      register: installed_nodes
+      changed_when: false
+
+    - name: Report the completed SNO installation
+      ansible.builtin.debug:
+        msg:
+          - "Cluster {{ cluster_name }} is installed and converged."
+          - "Kubeconfig: {{ kubeconfig_path }}"
+          - "Kubeadmin password: {{ kubeadmin_password_path }}"
+          - "{{ installed_nodes.stdout }}"

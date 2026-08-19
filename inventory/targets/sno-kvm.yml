@@ -1,0 +1,78 @@
+---
+target_schema_version: 1
+target_id: kvm-sno-kvm
+cpu_architecture: x86_64
+
+# Mode initial sécurisé
+automation_mode: plan
+target_provider: libvirt
+# Cible KVM/libvirt
+libvirt_uri: qemu:///system
+libvirt_vm_name: sno-kvm
+libvirt_network_name: sno-workshop
+libvirt_disk_target: vda
+libvirt_disk_path: /home/libvirt/images/sno-kvm.qcow2
+libvirt_iso_target: sda
+libvirt_boot_iso_path: /home/libvirt/images/sno-kvm-discovery.iso
+target_modification_approved: false
+
+# OpenShift
+cluster_name: sno-kvm
+base_dns_domain: lab.test
+openshift_version: "4.20"
+
+# Réseau de la VM
+sno_mac_address: "52:54:00:01:00:51"
+sno_ip_address: 192.168.130.10
+sno_prefix_length: 24
+sno_gateway: 192.168.130.1
+sno_dns_servers:
+  - 192.168.130.1
+
+# Le disque virtuel VirtIO dans la VM
+installation_disk_path: /dev/vda
+minimum_installation_disk_bytes: 100000000000
+
+# Assisted Installer
+infra_env_name: "{{ cluster_name }}-infra-env"
+discovery_image_type: full-iso
+
+# DHCP libvirt fournit l’adresse fixe grâce à la MAC
+sno_static_network_enabled: false
+
+# Fichiers locaux sur le contrôleur CentOS
+pull_secret_path: "/home/rayen/.config/openshift/pull-secret.json"
+ssh_public_key_path: "/home/rayen/.ssh/sno_kvm_ed25519.pub"
+ssh_private_key_path: "/home/rayen/.ssh/sno_kvm_ed25519"
+oc_binary_path: "/home/rayen/.local/bin/oc"
+
+discovery_iso_path: >-
+  /home/rayen/sno-automation/artifacts/{{ cluster_name }}-discovery.iso
+
+credentials_directory: >-
+  /home/rayen/sno-automation/artifacts/{{ cluster_name }}/credentials
+
+kubeconfig_path: "{{ credentials_directory }}/kubeconfig"
+kubeadmin_password_path: "{{ credentials_directory }}/kubeadmin-password"
+
+# DNS déjà fourni par le réseau libvirt
+dns_provider: existing
+dns_validation_server: 192.168.130.1
+dns_enforce_before_boot: true
+
+# Délais d’attente
+host_registration_retries: 2880
+host_registration_delay: 15
+
+api_access_retries: 120
+api_access_delay: 15
+
+installation_wait_retries: 720
+installation_wait_delay: 30
+
+cluster_convergence_retries: 720
+cluster_convergence_delay: 30
+
+# Pour le test final, attendre réellement la santé du cluster
+wait_for_cluster_convergence: true
+require_cluster_convergence: true

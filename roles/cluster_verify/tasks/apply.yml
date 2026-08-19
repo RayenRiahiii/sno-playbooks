@@ -1,0 +1,142 @@
+---
+- name: Require downloaded OpenShift credentials
+  ansible.builtin.assert:
+    that:
+      - sno_credentials_available | default(false) | bool
+    fail_msg: Cluster verification requires downloaded credentials.
+    quiet: true
+
+- name: Wait for the Kubernetes API
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary_path }}"
+      - --kubeconfig
+      - "{{ kubeconfig_path }}"
+      - get
+      - nodes
+      - -o
+      - name
+  register: kubernetes_api_check
+  changed_when: false
+  failed_when: false
+  until:
+    - kubernetes_api_check.rc == 0
+  retries: "{{ api_access_retries }}"
+  delay: "{{ api_access_delay }}"
+
+- name: Require access to the Kubernetes API
+  ansible.builtin.assert:
+    that:
+      - kubernetes_api_check.rc == 0
+    fail_msg: >-
+      Assisted Installer completed, but the Kubernetes API could not
+      be reached using the downloaded kubeconfig.
+    quiet: true
+
+- name: Wait for OpenShift convergence when requested
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary_path }}"
+      - --kubeconfig
+      - "{{ kubeconfig_path }}"
+      - get
+      - clusterversion
+      - version
+      - -o
+      - 'jsonpath={.status.conditions[?(@.type=="Available")].status} {.status.conditions[?(@.type=="Progressing")].status}'
+  register: converged_cluster_version
+  changed_when: false
+  failed_when: false
+  until:
+    - converged_cluster_version.rc == 0
+    - converged_cluster_version.stdout | trim == 'True False'
+  retries: "{{ cluster_convergence_retries }}"
+  delay: "{{ cluster_convergence_delay }}"
+  when: wait_for_cluster_convergence | bool
+
+- name: Read current OpenShift convergence state
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary_path }}"
+      - --kubeconfig
+      - "{{ kubeconfig_path }}"
+      - get
+      - clusterversion
+      - version
+      - -o
+      - 'jsonpath={.status.conditions[?(@.type=="Available")].status} {.status.conditions[?(@.type=="Progressing")].status}'
+  register: current_cluster_version
+  changed_when: false
+  failed_when: false
+  when: not (wait_for_cluster_convergence | bool)
+
+- name: Store the requested convergence result
+  ansible.builtin.set_fact:
+    sno_cluster_version_result: "{{ converged_cluster_version }}"
+  when: wait_for_cluster_convergence | bool
+
+- name: Store the current convergence result
+  ansible.builtin.set_fact:
+    sno_cluster_version_result: "{{ current_cluster_version }}"
+  when: not (wait_for_cluster_convergence | bool)
+
+- name: Calculate cluster health
+  ansible.builtin.set_fact:
+    sno_cluster_converged: >-
+      {{
+        sno_cluster_version_result.rc == 0
+        and
+        (sno_cluster_version_result.stdout | trim) == 'True False'
+      }}
+
+- name: Enforce convergence when required
+  ansible.builtin.assert:
+    that:
+      - sno_cluster_converged | bool
+    fail_msg: >-
+      The cluster is installed and its API is accessible, but the
+      ClusterVersion is not fully converged.
+    quiet: true
+  when: require_cluster_convergence | bool
+
+- name: Read the installed SNO node
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary_path }}"
+      - --kubeconfig
+      - "{{ kubeconfig_path }}"
+      - get
+      - nodes
+      - -o
+      - wide
+  register: installed_sno_nodes
+  changed_when: false
+
+- name: Read cluster operator status
+  ansible.builtin.command:
+    argv:
+      - "{{ oc_binary_path }}"
+      - --kubeconfig
+      - "{{ kubeconfig_path }}"
+      - get
+      - clusteroperators
+  register: installed_cluster_operators
+  changed_when: false
+  failed_when: false
+
+- name: Report the installed cluster
+  ansible.builtin.debug:
+    msg:
+      - "Cluster: {{ cluster_name }}"
+      - Assisted Installer installation is complete.
+      - Kubernetes API access succeeded.
+      - "Fully converged: {{ sno_cluster_converged }}"
+      - "Kubeconfig: {{ kubeconfig_path }}"
+      - "{{ installed_sno_nodes.stdout }}"
+      - >-
+        If fully converged is False, inspect:
+        oc --kubeconfig "{{ kubeconfig_path }}" get clusteroperators
+
+- name: Mark the automation workflow complete
+  ansible.builtin.set_fact:
+    sno_automation_completed: true

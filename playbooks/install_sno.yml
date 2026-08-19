@@ -1,0 +1,74 @@
+---
+- name: Install Single Node OpenShift
+  hosts: localhost
+  gather_facts: false
+
+  roles:
+    - role: preflight
+
+    - role: dns_preflight
+
+    - role: redhat_auth
+
+    - role: cluster_state
+
+    - role: workflow_plan
+
+    - role: cluster_definition
+      when: sno_workflow_action == 'create'
+
+    - role: infra_env
+      when: sno_workflow_action in ['create', 'discover']
+
+    - role: target_boot
+      when: sno_workflow_action in ['create', 'discover']
+
+    - role: host_discovery
+      when:
+        - sno_workflow_action in ['create', 'discover']
+        - not (sno_manual_action_required | default(false) | bool)
+        - sno_cluster_id | default('') | length > 0
+
+    - role: validation_report
+      when:
+        - sno_workflow_action in ['create', 'discover']
+        - not (sno_manual_action_required | default(false) | bool)
+        - sno_cluster_id | default('') | length > 0
+
+    - role: disk_selection
+      when:
+        - sno_workflow_action in ['create', 'discover']
+        - not (sno_manual_action_required | default(false) | bool)
+        - sno_cluster_id | default('') | length > 0
+
+    - role: installation_start
+      when:
+        - sno_workflow_action in ['create', 'discover']
+        - not (sno_manual_action_required | default(false) | bool)
+        - sno_cluster_id | default('') | length > 0
+
+    - role: installation_monitor
+      when:
+        - >-
+          sno_workflow_action == 'monitor'
+          or (sno_installation_started | default(false) | bool)
+
+    - role: post_install_boot
+      when:
+        - >-
+          sno_workflow_action in ['verify', 'recover']
+          or (sno_installation_completed | default(false) | bool)
+
+    - role: credential_download
+      when:
+        - >-
+          sno_workflow_action in ['verify', 'recover']
+          or (sno_installation_completed | default(false) | bool)
+
+    - role: cluster_verify
+      when:
+        - >-
+          sno_workflow_action in ['verify', 'recover']
+          or (sno_installation_completed | default(false) | bool)
+
+    - role: workflow_summary

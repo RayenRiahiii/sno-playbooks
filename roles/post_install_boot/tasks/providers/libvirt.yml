@@ -1,0 +1,176 @@
+---
+- name: Require libvirt post-install variables
+  ansible.builtin.assert:
+    that:
+      - libvirt_uri is defined
+      - libvirt_vm_name is defined
+      - libvirt_iso_target is defined
+      - libvirt_boot_iso_path is defined
+      - ssh_private_key_path is defined
+    fail_msg: The libvirt post-install settings are incomplete.
+    quiet: true
+
+- name: Read the post-install libvirt VM state
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domstate
+      - "{{ libvirt_vm_name }}"
+  environment:
+    LC_ALL: C
+  register: post_install_libvirt_state
+  changed_when: false
+  failed_when: false
+
+- name: Store and validate the libvirt VM state
+  ansible.builtin.set_fact:
+    sno_post_install_vm_state: >-
+      {{ post_install_libvirt_state.stdout | trim }}
+
+- name: Require a supported libvirt VM state
+  ansible.builtin.assert:
+    that:
+      - post_install_libvirt_state.rc == 0
+      - sno_post_install_vm_state in ['shut off', 'running']
+    fail_msg: >-
+      VM {{ libvirt_vm_name }} is missing or has an unsupported state:
+      {{ sno_post_install_vm_state }}.
+    quiet: true
+
+- name: Read the persistent next-boot configuration
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - dumpxml
+      - "{{ libvirt_vm_name }}"
+      - --inactive
+  environment:
+    LC_ALL: C
+  register: post_install_libvirt_inactive_xml
+  changed_when: false
+
+- name: Read the currently attached block devices
+  ansible.builtin.command:
+    argv:
+      - virsh
+      - --connect
+      - "{{ libvirt_uri }}"
+      - domblklist
+      - "{{ libvirt_vm_name }}"
+      - --details
+  environment:
+    LC_ALL: C
+  register: post_install_libvirt_block_devices
+  changed_when: false
+
+- name: Determine the ISO and next-boot states
+  ansible.builtin.set_fact:
+    sno_discovery_iso_attached: >-
+      {{
+        libvirt_boot_iso_path
+        in post_install_libvirt_block_devices.stdout
+      }}
+    libvirt_persistent_iso_attached: >-
+      {{
+        libvirt_boot_iso_path
+        in post_install_libvirt_inactive_xml.stdout
+      }}
+    libvirt_next_boot_is_disk: >-
+      {{
+        (
+          post_install_libvirt_inactive_xml.stdout
+          is search("boot dev='hd'")
+        )
+        and
+        (
+          post_install_libvirt_inactive_xml.stdout
+          is not search("boot dev='cdrom'")
+        )
+        and
+        (
+          libvirt_boot_iso_path
+          not in post_install_libvirt_inactive_xml.stdout
+        )
+      }}
+
+- name: Probe the running operating system
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/timeout
+      - "20"
+      - ssh
+      - -o
+      - BatchMode=yes
+      - -o
+      - ConnectTimeout=8
+      - -o
+      - StrictHostKeyChecking=no
+      - -o
+      - UserKnownHostsFile=/dev/null
+      - -i
+      - "{{ ssh_private_key_path }}"
+      - "core@{{ sno_ip_address }}"
+      - cat
+      - /proc/cmdline
+  register: post_install_libvirt_probe
+  changed_when: false
+  failed_when: false
+  when: sno_post_install_vm_state == 'running'
+
+- name: Identify the current libvirt boot source
+  ansible.builtin.set_fact:
+    sno_post_install_boot_source: >-
+      {% if sno_post_install_vm_state == 'shut off' %}
+      stopped
+      {% elif
+        (post_install_libvirt_probe.rc | default(1)) == 0
+        and 'coreos.liveiso=' in post_install_libvirt_probe.stdout
+      %}
+      discovery-iso
+      {% elif (post_install_libvirt_probe.rc | default(1)) == 0 %}
+      installed-disk
+      {% else %}
+      unknown
+      {% endif %}
+
+- name: Select the required libvirt post-install action
+  ansible.builtin.set_fact:
+    sno_post_install_action: >-
+      {% if sno_post_install_vm_state == 'shut off' %}
+      start-installed-disk
+      {% elif sno_post_install_boot_source | trim == 'discovery-iso' %}
+      restart-from-installed-disk
+      {% elif
+        sno_post_install_boot_source | trim == 'installed-disk'
+        and libvirt_next_boot_is_disk | bool
+      %}
+      none
+      {% elif sno_post_install_boot_source | trim == 'installed-disk' %}
+      repair-next-boot
+      {% else %}
+      inspect-required
+      {% endif %}
+
+- name: Report the libvirt post-install state
+  ansible.builtin.debug:
+    msg:
+      - "VM: {{ libvirt_vm_name }}"
+      - "VM state: {{ sno_post_install_vm_state }}"
+      - >-
+        Discovery ISO attached in current session:
+        {{ sno_discovery_iso_attached }}
+      - >-
+        Discovery ISO in persistent configuration:
+        {{ libvirt_persistent_iso_attached }}
+      - "Current boot source: {{ sno_post_install_boot_source | trim }}"
+      - "Next boot uses installed disk: {{ libvirt_next_boot_is_disk }}"
+      - "Required action: {{ sno_post_install_action | trim }}"
+      - This inspection did not modify or restart the VM.
+- name: Apply the libvirt post-install action
+  ansible.builtin.include_tasks:
+    file: libvirt_apply.yml
+  when: automation_mode == 'apply'

@@ -1,0 +1,16 @@
+---
+# Use this provider when the target has no supported BMC. The playbook prepares
+# the discovery ISO and waits while an operator attaches/boots it.
+target_provider: manual_iso
+
+cluster_name: edge-sno-01
+base_dns_domain: example.com
+openshift_version: '4.20'
+
+sno_mac_address: 'AA:BB:CC:DD:EE:FF'
+sno_ip_address: 192.0.2.50
+sno_prefix_length: 24
+sno_gateway: 192.0.2.1
+sno_dns_servers:
+  - 192.0.2.53
+installation_disk_path: /dev/sda
